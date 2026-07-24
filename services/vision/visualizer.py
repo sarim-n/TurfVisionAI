@@ -1,13 +1,13 @@
 """
-Purpose: Visualization helper for rendering player detection bounding boxes on OpenCV frames.
+Purpose: Visualization helper for rendering player and ball detection annotations on OpenCV frames.
 Dependencies: cv2, numpy, services.vision.models
-Inputs: Raw image frame, PlayerDetectionResult
+Inputs: Raw image frame, PlayerDetectionResult / BallDetectionResult
 Outputs: Annotated BGR image frame
 """
 
 import cv2
 import numpy as np
-from services.vision.models import PlayerDetectionResult
+from services.vision.models import BallDetectionResult, PlayerDetectionResult
 
 
 def draw_player_detections(
@@ -46,5 +46,39 @@ def draw_player_detections(
             foot_x = int((bbox.x1 + bbox.x2) / 2.0)
             foot_y = int(bbox.y2)
             cv2.circle(annotated, (foot_x, foot_y), 4, (0, 0, 255), -1)
+
+    return annotated
+
+
+def draw_ball_detections(
+    image: np.ndarray,
+    result: BallDetectionResult,
+    ball_color: tuple[int, int, int] = (0, 255, 255),
+) -> np.ndarray:
+    """Draws football detection circle highlight and target marker on OpenCV image arrays."""
+    annotated = image.copy()
+
+    if result.has_ball and result.ball_object is not None:
+        bbox = result.ball_object.bbox
+        center_x = int(bbox.center.x)
+        center_y = int(bbox.center.y)
+        radius = max(6, int(max(bbox.x2 - bbox.x1, bbox.y2 - bbox.y1) / 2.0))
+
+        # Draw highlighted circle around football
+        cv2.circle(annotated, (center_x, center_y), radius + 3, ball_color, 2)
+        cv2.circle(annotated, (center_x, center_y), 2, (0, 0, 255), -1)
+
+        # Label text
+        label_text = f"Ball {result.ball_object.confidence:.2f}"
+        cv2.putText(
+            annotated,
+            label_text,
+            (center_x + radius + 5, center_y + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            ball_color,
+            1,
+            cv2.LINE_AA,
+        )
 
     return annotated
