@@ -1,13 +1,14 @@
 """
-Purpose: Visualization helper for rendering player detections, ball detections, player tracks, ball tracking vectors, 2D tactical maps, and goal line wireframes on OpenCV frames.
-Dependencies: cv2, numpy, services.vision.models, services.vision.homography, services.vision.goal_line
-Inputs: Raw image frame, tracking results, GoalLineDetector
+Purpose: Visualization helper for rendering player detections, ball detections, player tracks, ball tracking vectors, 2D tactical maps, goal line wireframes, and TV scoreboards on OpenCV frames.
+Dependencies: cv2, numpy, services.vision.models, services.vision.homography, services.vision.goal_line, services.event_engine.scoreboard
+Inputs: Raw image frame, tracking results, GoalLineDetector, ScoreboardEngine
 Outputs: Annotated BGR image frame
 """
 
 from typing import Optional
 import cv2
 import numpy as np
+from services.event_engine.scoreboard import ScoreboardEngine
 from services.vision.goal_line import GoalLineDetector
 from services.vision.homography import PitchHomography
 from services.vision.models import (
@@ -298,5 +299,51 @@ def draw_goal_lines(
             1,
             cv2.LINE_AA,
         )
+
+    return annotated
+
+
+def draw_scoreboard_overlay(
+    image: np.ndarray,
+    scoreboard: ScoreboardEngine,
+) -> np.ndarray:
+    """Renders a broadcast TV-style scoreboard banner overlay at the top-left of image frames."""
+    annotated = image.copy()
+    box_x, box_y = 20, 20
+    box_w, box_h = 280, 45
+
+    # Dark translucent banner background
+    overlay = annotated.copy()
+    cv2.rectangle(overlay, (box_x, box_y), (box_x + box_w, box_y + box_h), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.85, annotated, 0.15, 0, annotated)
+
+    # White border frame
+    cv2.rectangle(annotated, (box_x, box_y), (box_x + box_w, box_y + box_h), (255, 255, 255), 1)
+
+    # Team names & score: HOME 2 - 1 AWAY
+    score_text = f"{scoreboard.home_team_name} {scoreboard.home_score} - {scoreboard.away_score} {scoreboard.away_team_name}"
+    cv2.putText(
+        annotated,
+        score_text,
+        (box_x + 12, box_y + 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+    # Clock & Period status text: 1st Half | 12:45
+    clock_text = f"{scoreboard.period.value.upper()} | {scoreboard.format_clock()}"
+    cv2.putText(
+        annotated,
+        clock_text,
+        (box_x + 12, box_y + 38),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        (0, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
 
     return annotated
