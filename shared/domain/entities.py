@@ -1,11 +1,12 @@
 """
-Purpose: Defines domain entities and value objects for the football vision pipeline.
-Dependencies: pydantic, enum
-Inputs: Object coordinates, track identifiers, game status
-Outputs: Validated domain entities
+Purpose: Core domain entities and value objects for the TurfVision AI system.
+Dependencies: pydantic
+Inputs: Primitive types (floats, ints, strings)
+Outputs: Immutable domain DTOs (BoundingBox, Point2D, MatchState)
 """
 
 from enum import Enum
+from typing import Optional
 from pydantic import BaseModel, Field
 
 
@@ -13,7 +14,7 @@ class TrackedObjectType(str, Enum):
     PLAYER = "player"
     BALL = "ball"
     REFEREE = "referee"
-    GOAL_POST = "goal_post"
+    GOAL = "goal"
 
 
 class TeamSide(str, Enum):
@@ -23,35 +24,63 @@ class TeamSide(str, Enum):
 
 
 class Point2D(BaseModel):
-    """2D Spatial Coordinate (pixel space or bird's eye pitch space)."""
+    """Immutable 2D coordinate on pixel canvas or 2D pitch ground plane."""
     x: float
     y: float
 
+    @property
+    def x_meters(self) -> float:
+        return self.x
+
+    @property
+    def y_meters(self) -> float:
+        return self.y
+
 
 class BoundingBox(BaseModel):
-    """Axis-Aligned Bounding Box (xyxy format)."""
-    x1: float = Field(..., description="Top-left X coordinate")
-    y1: float = Field(..., description="Top-left Y coordinate")
-    x2: float = Field(..., description="Bottom-right X coordinate")
-    y2: float = Field(..., description="Bottom-right Y coordinate")
+    """Bounding box representation in standard xyxy coordinate format."""
+    x1: float
+    y1: float
+    x2: float
+    y2: float
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
     @property
+    def width(self) -> float:
+        return max(0.0, self.x2 - self.x1)
+
+    @property
+    def height(self) -> float:
+        return max(0.0, self.y2 - self.y1)
+
+    @property
+    def area(self) -> float:
+        return self.width * self.height
+
+    @property
     def center(self) -> Point2D:
-        """Computes the center point of the bounding box."""
-        return Point2D(x=(self.x1 + self.x2) / 2.0, y=(self.y1 + self.y2) / 2.0)
+        return Point2D(x=self.x1 + self.width / 2.0, y=self.y1 + self.height / 2.0)
+
+    @property
+    def ground_position(self) -> Point2D:
+        """Ground contact point (bottom-center of bounding box) for player feet."""
+        return Point2D(x=self.x1 + self.width / 2.0, y=self.y2)
 
     @property
     def bottom_center(self) -> Point2D:
-        """Computes the bottom center point (ideal for player ground position)."""
-        return Point2D(x=(self.x1 + self.x2) / 2.0, y=self.y2)
+        return self.ground_position
+
+    @property
+    def aspect_ratio(self) -> float:
+        return self.width / self.height if self.height > 0 else 0.0
 
 
 class MatchState(BaseModel):
-    """Represents live match state telemetry."""
-    match_id: str
+    """Immutable domain snapshot representing live match scoreboard and period status."""
+    match_id: str = "match_01"
     home_score: int = 0
     away_score: int = 0
     elapsed_seconds: float = 0.0
     possession_team: TeamSide = TeamSide.UNKNOWN
-    is_active: bool = True
+    current_period: str = "1st_half"
+    is_active: bool = False

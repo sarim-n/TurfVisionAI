@@ -1,14 +1,14 @@
 """
-Purpose: Camera Calibration & Perspective Transformation (Homography) Engine.
+Purpose: Perspective transformation & pitch calibration engine using OpenCV homography matrices.
 Dependencies: cv2, numpy, services.vision.models, shared.domain.entities, shared.logging
-Inputs: Pixel coordinates [(x,y)] and corresponding real-world pitch metric coordinates [(X,Y)]
-Outputs: PitchHomography instance transforming pixel points to real-world meters
+Inputs: 2D pixel coordinates, image dimension bounds
+Outputs: 2D pitch coordinates in real-world meters (0..105m, 0..68m)
 """
 
-from typing import Sequence
+from typing import Optional, Union
 import cv2
 import numpy as np
-from services.vision.models import PitchDimensions, PitchPoint
+from services.vision.models import PitchDimensions
 from shared.domain.entities import Point2D
 from shared.logging import setup_logger
 
@@ -16,70 +16,78 @@ logger = setup_logger("pitch_homography", service_name="vision")
 
 
 class PitchHomography:
-    """Computes and applies 3x3 Homography matrix transformations between camera pixel space and 2D pitch metric space."""
+    """Computes and applies 3x3 homography transformation between camera pixel coordinates and pitch meters."""
 
     def __init__(
         self,
-        pixel_points: Sequence[tuple[float, float]],
-        pitch_points: Sequence[tuple[float, float]],
-        pitch_dimensions: PitchDimensions = PitchDimensions(),
+        homography_matrix_or_src: Union[np.ndarray, list[tuple[float, float]]],
+        dst_points: Optional[list[tuple[float, float]]] = None,
+        dimensions: Optional[PitchDimensions] = None,
     ):
-        if len(pixel_points) < 4 or len(pitch_points) < 4 or len(pixel_points) != len(pitch_points):
-            raise ValueError("Homography calibration requires at least 4 matching point pairs.")
+        if isinstance(homography_matrix_or_src, list) and dst_points is not None:
+            src_pts = np.array(homography_matrix_or_src, dtype=np.float32)
+            dst_pts = np.array(dst_points, dtype=np.float32)
+            H, _ = cv2.findHomography(src_pts, dst_pts)
+            homography_matrix = H
+        else:
+            homography_matrix = homography_matrix_or_src
 
-        self.pitch_dimensions = pitch_dimensions
-        self.pixel_points = np.array(pixel_points, dtype=np.float32)
-        self.pitch_points = np.array(pitch_points, dtype=np.float32)
+        if homography_matrix is None or homography_matrix.shape != (3, 3):
+            raise ValueError("Homography matrix must be 3x3 float array")
 
-        # Compute 3x3 Homography matrix H (pixel -> pitch)
-        self.H, status = cv2.findHomography(self.pixel_points, self.pitch_points, cv2.RANSAC, 5.0)
-        if self.H is None:
-            raise ValueError("Failed to compute Homography matrix from provided point correspondences.")
-
-        # Compute Inverse Homography matrix H_inv (pitch -> pixel)
+        self.H = homography_matrix.astype(np.float64)
         self.H_inv = np.linalg.inv(self.H)
-        logger.info("Computed 3x3 Pitch Homography matrix successfully.")
-
-    def pixel_to_pitch(self, pixel_pt: Point2D) -> PitchPoint:
-        """Transforms a 2D pixel point (x, y) into real-world 2D pitch coordinates (meters)."""
-        src = np.array([[[pixel_pt.x, pixel_pt.y]]], dtype=np.float32)
-        dst = cv2.perspectiveTransform(src, self.H)
-        x_meters = float(dst[0, 0, 0])
-        y_meters = float(dst[0, 0, 1])
-
-        # Clamp to pitch dimensions
-        x_clamped = max(0.0, min(self.pitch_dimensions.length_meters, x_meters))
-        y_clamped = max(0.0, min(self.pitch_dimensions.width_meters, y_meters))
-
-        return PitchPoint(x_meters=round(x_clamped, 2), y_meters=round(y_clamped, 2))
-
-    def pitch_to_pixel(self, pitch_pt: PitchPoint) -> Point2D:
-        """Transforms real-world 2D pitch coordinates (meters) into camera pixel coordinates (x, y)."""
-        src = np.array([[[pitch_pt.x_meters, pitch_pt.y_meters]]], dtype=np.float32)
-        dst = cv2.perspectiveTransform(src, self.H_inv)
-        px = float(dst[0, 0, 0])
-        py = float(dst[0, 0, 1])
-        return Point2D(x=round(px, 1), y=round(py, 1))
+        self.dimensions = dimensions or PitchDimensions()
 
     @classmethod
-    def create_default_calibration(
-        cls,
-        image_width: int,
-        image_height: int,
-        pitch_dimensions: PitchDimensions = PitchDimensions(),
-    ) -> "PitchHomography":
-        """Creates a standard synthetic bounding box perspective mapping for full-frame camera feeds."""
-        # 4 corners of frame -> 4 corners of pitch
-        pixel_corners = [
-            (0.0, 0.0),
-            (float(image_width), 0.0),
-            (float(image_width), float(image_height)),
-            (0.0, float(image_height)),
-        ]
-        pitch_corners = [
-            (0.0, 0.0),
-            (pitch_dimensions.length_meters, 0.0),
-            (pitch_dimensions.length_meters, pitch_dimensions.width_meters),
-            (0.0, pitch_dimensions.width_meters),
-        ]
-        return cls(pixel_corners, pitch_corners, pitch_dimensions)
+    def create_default_calibration(cls, image_width: int, image_height: int) -> "PitchHomography":
+        """Generates synthetic 4-point corner calibration for fallback pitch mapping."""
+        src_points = np.array(
+            [
+                [0.0, 0.0],
+                [float(image_width), 0.0],
+                [float(image_width), float(image_height)],
+                [0.0, float(image_height)],
+            ],
+            dtype=np.float32,
+        )
+
+        # Standard Pitch bounds: 105m x 68m
+        dst_points = np.array(
+            [
+                [0.0, 0.0],
+                [105.0, 0.0],
+                [105.0, 68.0],
+                [0.0, 68.0],
+            ],
+            dtype=np.float32,
+        )
+
+        H, _ = cv2.findHomography(src_points, dst_points)
+        logger.info("Computed 3x3 Pitch Homography matrix successfully.")
+        return cls(H)
+
+    def pixel_to_pitch(self, point: Point2D) -> Point2D:
+        """Transforms 2D pixel canvas coordinate to 2D pitch coordinate in meters."""
+        vec = np.array([point.x, point.y, 1.0], dtype=np.float64)
+        transformed = np.dot(self.H, vec)
+        if abs(transformed[2]) < 1e-6:
+            return Point2D(x=0.0, y=0.0)
+        x_m = transformed[0] / transformed[2]
+        y_m = transformed[1] / transformed[2]
+        return Point2D(x=float(x_m), y=float(y_m))
+
+    # Alias for visualizer and test suite
+    transform_pixel_to_pitch = pixel_to_pitch
+
+    def pitch_to_pixel(self, point: Point2D) -> Point2D:
+        """Transforms 2D pitch coordinate in meters back to 2D pixel canvas coordinate."""
+        vec = np.array([point.x, point.y, 1.0], dtype=np.float64)
+        transformed = np.dot(self.H_inv, vec)
+        if abs(transformed[2]) < 1e-6:
+            return Point2D(x=0.0, y=0.0)
+        px = transformed[0] / transformed[2]
+        py = transformed[1] / transformed[2]
+        return Point2D(x=float(px), y=float(py))
+
+    transform_pitch_to_pixel = pitch_to_pixel

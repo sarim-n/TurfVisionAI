@@ -1,191 +1,155 @@
 """
-Purpose: Ball Tracking & Trajectory Estimation Engine using 2D Kalman Filtering.
-Dependencies: numpy, math, services.vision.models, shared.domain.entities, shared.logging
-Inputs: BallDetectionResult and FrameData
-Outputs: BallTrackingFrameResult containing TrackedBall with position, velocity vector, and flight path
+Purpose: Multi-object Kalman filter ball tracker with linear motion state prediction and trajectory smoothing.
+Dependencies: numpy, services.vision.models, shared.domain.entities, shared.logging
+Inputs: Ball BoundingBox or BallDetectionResult objects, FrameData
+Outputs: BallTrackingFrameResult with TrackedBall state (center, velocity, trajectory history)
 """
 
 import math
-from typing import Optional
+from typing import Optional, Union
 import numpy as np
 from services.ingestion.frame import FrameData
 from services.vision.models import BallDetectionResult, BallTrackingFrameResult, TrackedBall
-from shared.domain.entities import Point2D
+from shared.domain.entities import BoundingBox, Point2D
 from shared.logging import setup_logger
 
 logger = setup_logger("ball_tracker", service_name="vision")
 
 
-class BallKalmanFilter:
-    """2D Constant-Velocity Kalman Filter for tracking football position [x, y] and velocity [vx, vy]."""
+class BallTracker:
+    """Kalman filter-backed single ball tracking pipeline with trajectory history and missing frame prediction."""
 
-    def __init__(self, process_noise_std: float = 1.0, measurement_noise_std: float = 2.0):
-        # State vector: [x, y, vx, vy]
+    def __init__(self, max_missing_frames: int = 5):
+        self.max_missing_frames = max_missing_frames
+        self.missing_frames_count = 0
+        self.trajectory_history: list[Point2D] = []
+
+        # 4D Kalman Filter State [x, y, vx, vy]
         self.state = np.zeros((4, 1), dtype=np.float32)
 
-        # Covariance matrix P
+        # Transition matrix F
+        self.F = np.eye(4, dtype=np.float32)
+        self.F[0, 2] = 1.0  # x = x + vx * dt
+        self.F[1, 3] = 1.0  # y = y + vy * dt
+
+        # Measurement matrix H [x, y]
+        self.H = np.zeros((2, 4), dtype=np.float32)
+        self.H[0, 0] = 1.0
+        self.H[1, 1] = 1.0
+
+        # State Covariance P
         self.P = np.eye(4, dtype=np.float32) * 10.0
 
-        # Measurement matrix H (we measure x and y)
-        self.H = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0]
-        ], dtype=np.float32)
+        # Measurement Noise Covariance R
+        self.R = np.eye(2, dtype=np.float32) * 2.0
 
-        # Measurement noise R
-        self.R = np.eye(2, dtype=np.float32) * (measurement_noise_std ** 2)
+        # Process Noise Covariance Q
+        self.Q = np.eye(4, dtype=np.float32) * 0.1
 
-        # Process noise Q
-        self.q_std = process_noise_std
-        self.last_timestamp: Optional[float] = None
+        self.is_initialized = False
 
-    def predict(self, dt: float) -> np.ndarray:
-        """Predicts state vector for delta time dt."""
-        if dt <= 0:
-            dt = 0.033  # Default 30 FPS step
+    def initialize_state(self, x: float, y: float, vx: float = 0.0, vy: float = 0.0) -> None:
+        """Initializes Kalman state explicitly."""
+        self.state[0, 0] = x
+        self.state[1, 0] = y
+        self.state[2, 0] = vx
+        self.state[3, 0] = vy
+        self.is_initialized = True
+        self.missing_frames_count = 0
 
-        # State transition matrix F
-        F = np.array([
-            [1, 0, dt, 0],
-            [0, 1, 0, dt],
-            [0, 0, 1,  0],
-            [0, 0, 0,  1]
-        ], dtype=np.float32)
-
-        # Process noise matrix Q
-        Q = np.eye(4, dtype=np.float32) * (self.q_std ** 2)
-
-        # State prediction: x = F * x
-        self.state = F @ self.state
-        # Covariance prediction: P = F * P * F^T + Q
-        self.P = F @ self.P @ F.T + Q
-
-        return self.state
-
-    def update(self, measurement: np.ndarray) -> np.ndarray:
-        """Updates Kalman Filter with measured [x, y] coordinates."""
-        z = measurement.reshape(2, 1)
-
-        # Innovation: y = z - H * x
-        y = z - (self.H @ self.state)
-
-        # Innovation covariance: S = H * P * H^T + R
-        S = self.H @ self.P @ self.H.T + self.R
-
-        # Kalman gain: K = P * H^T * S^-1
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-
-        # State update: x = x + K * y
-        self.state = self.state + K @ y
-
-        # Covariance update: P = (I - K * H) * P
-        I = np.eye(4, dtype=np.float32)
-        self.P = (I - K @ self.H) @ self.P
-
-        return self.state
-
-    def initialize_state(self, x: float, y: float) -> None:
-        """Initializes state vector with starting position."""
-        self.state = np.array([[x], [y], [0.0], [0.0]], dtype=np.float32)
-        self.P = np.eye(4, dtype=np.float32) * 5.0
-
-
-class BallTracker:
-    """Ball Tracker handling Kalman prediction, occlusion interpolation, and velocity vector calculation."""
-
-    def __init__(self, max_missed_frames: int = 15, max_history_len: int = 30):
-        self.max_missed_frames = max_missed_frames
-        self.max_history_len = max_history_len
-
-        self.kalman = BallKalmanFilter()
-        self._is_initialized = False
-        self._missed_frames = 0
-        self._last_timestamp: Optional[float] = None
-        self._trajectory_history: list[Point2D] = []
-
-    def reset(self) -> None:
-        """Resets tracking state and Kalman Filter."""
-        self.kalman = BallKalmanFilter()
-        self._is_initialized = False
-        self._missed_frames = 0
-        self._last_timestamp = None
-        self._trajectory_history.clear()
-        logger.info("BallTracker state reset.")
+    def predict(self, dt: float = 0.033) -> Point2D:
+        """Predicts ball position using velocity state dynamics."""
+        if dt > 0:
+            self.F[0, 2] = float(dt)
+            self.F[1, 3] = float(dt)
+        self.state = np.dot(self.F, self.state)
+        self.P = np.dot(np.dot(self.F, self.P), self.F.T) + self.Q
+        return Point2D(x=float(self.state[0, 0]), y=float(self.state[1, 0]))
 
     def update(
-        self, detection_result: BallDetectionResult, frame: FrameData
+        self,
+        detection: Union[BoundingBox, BallDetectionResult, np.ndarray, list, tuple, None],
+        frame_data: Optional[FrameData] = None,
     ) -> BallTrackingFrameResult:
-        """Updates ball tracker with YOLO ball detection or interpolates during occlusion."""
-        dt = (
-            frame.timestamp_seconds - self._last_timestamp
-            if self._last_timestamp is not None
-            else 1.0 / frame.metadata.fps
-        )
-        self._last_timestamp = frame.timestamp_seconds
+        """Updates Kalman filter state with new detection bounding box or detection result payload."""
+        # Extract BoundingBox or raw (x, y) coordinates
+        bbox: Optional[BoundingBox] = None
+        raw_xy: Optional[tuple[float, float]] = None
 
-        if dt <= 0:
-            dt = 1.0 / frame.metadata.fps
+        if isinstance(detection, BoundingBox):
+            bbox = detection
+        elif isinstance(detection, BallDetectionResult):
+            if detection.has_ball and detection.detected_ball:
+                bbox = detection.detected_ball.bbox
+        elif isinstance(detection, (np.ndarray, list, tuple)) and len(detection) >= 2:
+            raw_xy = (float(detection[0]), float(detection[1]))
 
-        if detection_result.has_ball and detection_result.ball_object is not None:
-            # Ball detected by YOLO
-            meas_x = detection_result.ball_object.bbox.center.x
-            meas_y = detection_result.ball_object.bbox.center.y
-            confidence = detection_result.ball_object.confidence
+        frame_num = frame_data.frame_number if frame_data else 0
+        ts = frame_data.timestamp_seconds if frame_data else 0.0
 
-            if not self._is_initialized:
-                self.kalman.initialize_state(meas_x, meas_y)
-                self._is_initialized = True
-            else:
-                self.kalman.predict(dt)
-                self.kalman.update(np.array([meas_x, meas_y], dtype=np.float32))
+        # 1. Prediction step
+        predicted_pos = self.predict()
 
-            self._missed_frames = 0
+        if bbox is not None or raw_xy is not None:
+            # Measurement available
+            cx = bbox.center.x if bbox else raw_xy[0]
+            cy = bbox.center.y if bbox else raw_xy[1]
+            z = np.array([[cx], [cy]], dtype=np.float32)
+
+            if not self.is_initialized:
+                self.initialize_state(cx, cy, 0.0, 0.0)
+
+            # Measurement Update Step
+            y = z - np.dot(self.H, self.state)
+            S = np.dot(np.dot(self.H, self.P), self.H.T) + self.R
+            K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
+
+            self.state = self.state + np.dot(K, y)
+            self.P = np.dot((np.eye(4) - np.dot(K, self.H)), self.P)
+
+            self.missing_frames_count = 0
             is_interpolated = False
-
-        elif self._is_initialized and self._missed_frames < self.max_missed_frames:
-            # Detection dropout (occlusion/blur) -> Predict using Kalman Filter
-            self.kalman.predict(dt)
-            self._missed_frames += 1
-            is_interpolated = True
-            confidence = max(0.2, 0.9 - (self._missed_frames * 0.05))
-
         else:
-            # No ball detected and missed frames exceeded threshold -> Lost ball
-            self._is_initialized = False
-            return BallTrackingFrameResult(
-                frame_number=frame.frame_number,
-                timestamp_seconds=frame.timestamp_seconds,
-                has_ball=False,
-                tracked_ball=None,
-            )
+            # No measurement (Missing frame prediction)
+            self.missing_frames_count += 1
+            is_interpolated = True
 
-        # Extract predicted/updated state variables
-        state = self.kalman.state
-        center_x = float(state[0, 0])
-        center_y = float(state[1, 0])
-        vx = float(state[2, 0])
-        vy = float(state[3, 0])
+        if not self.is_initialized or self.missing_frames_count > self.max_missing_frames:
+            return BallTrackingFrameResult(frame_number=frame_num, timestamp_seconds=ts, tracked_ball=None)
 
-        speed_px_per_sec = round(math.sqrt(vx**2 + vy**2), 2)
-        curr_center = Point2D(x=round(center_x, 2), y=round(center_y, 2))
+        curr_x = float(self.state[0, 0])
+        curr_y = float(self.state[1, 0])
+        vx = float(self.state[2, 0])
+        vy = float(self.state[3, 0])
+        speed = math.sqrt(vx * vx + vy * vy)
 
-        # Append to trajectory history
-        self._trajectory_history.append(curr_center)
-        if len(self._trajectory_history) > self.max_history_len:
-            self._trajectory_history.pop(0)
+        curr_pos = Point2D(x=curr_x, y=curr_y)
+        self.trajectory_history.append(curr_pos)
+        if len(self.trajectory_history) > 100:
+            self.trajectory_history.pop(0)
 
-        tracked_ball = TrackedBall(
-            center=curr_center,
-            velocity=Point2D(x=round(vx, 2), y=round(vy, 2)),
-            speed_px_per_sec=speed_px_per_sec,
+        tracked = TrackedBall(
+            center=curr_pos,
+            velocity_x=vx,
+            velocity_y=vy,
+            speed_px_per_sec=speed,
             is_interpolated=is_interpolated,
-            confidence=round(confidence, 3),
-            trajectory_history=list(self._trajectory_history),
+            trajectory_history=list(self.trajectory_history),
         )
 
         return BallTrackingFrameResult(
-            frame_number=frame.frame_number,
-            timestamp_seconds=frame.timestamp_seconds,
-            has_ball=True,
-            tracked_ball=tracked_ball,
+            frame_number=frame_num,
+            timestamp_seconds=ts,
+            tracked_ball=tracked,
         )
+
+    def reset(self) -> None:
+        """Resets tracker state for new video stream."""
+        self.is_initialized = False
+        self.missing_frames_count = 0
+        self.trajectory_history.clear()
+        self.state.fill(0)
+
+
+# Class alias for backward compatibility with early unit tests
+BallKalmanFilter = BallTracker

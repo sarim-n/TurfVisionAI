@@ -1,11 +1,13 @@
 """
-Purpose: Scoreboard Engine & Match State Machine maintaining live match score, game timer, and event logging.
-Dependencies: enum, datetime, shared.domain.entities, shared.schemas.events, shared.logging
-Inputs: MatchEvent payloads, clock tick updates, and user control signals
-Outputs: Live MatchState snapshot, formatted clock string, and event history
+Purpose: Scoreboard Engine managing live match score, timer clock, match periods, and event history log.
+Dependencies: pydantic, services.ingestion.frame, shared.domain.entities, shared.schemas.events, shared.logging
+Inputs: MatchEvent objects and timer tick intervals
+Outputs: MatchState domain snapshots and formatted match clock strings
 """
 
 from enum import Enum
+from typing import Optional
+from pydantic import BaseModel, Field
 from shared.domain.entities import MatchState, TeamSide
 from shared.logging import setup_logger
 from shared.schemas.events import EventType, MatchEvent
@@ -23,7 +25,7 @@ class MatchPeriod(str, Enum):
 
 
 class ScoreboardEngine:
-    """State Machine maintaining official match score, timer, period, and event log."""
+    """Scoreboard state machine maintaining live score, game clock, periods, and event history."""
 
     def __init__(
         self,
@@ -38,66 +40,59 @@ class ScoreboardEngine:
         self.home_score = 0
         self.away_score = 0
         self.elapsed_seconds = 0.0
-        self.period = MatchPeriod.NOT_STARTED
+        self.current_period = MatchPeriod.NOT_STARTED
+        self.is_active = False
         self.event_log: list[MatchEvent] = []
 
+    @property
+    def period(self) -> MatchPeriod:
+        return self.current_period
+
     def start_match(self) -> None:
-        """Starts match and transitions period to 1st Half."""
-        self.period = MatchPeriod.FIRST_HALF
+        """Starts match clock and sets active period to FIRST_HALF."""
+        self.is_active = True
+        self.current_period = MatchPeriod.FIRST_HALF
         logger.info(f"Match {self.match_id} started: 1st Half.")
 
     def pause_match(self) -> None:
-        """Pauses game clock."""
-        self.period = MatchPeriod.PAUSED
+        """Pauses game clock and sets period to PAUSED."""
+        self.is_active = False
+        self.current_period = MatchPeriod.PAUSED
         logger.info(f"Match {self.match_id} paused.")
 
-    def resume_match(self) -> None:
-        """Resumes game clock."""
-        if self.elapsed_seconds < 2700:  # 45 mins
-            self.period = MatchPeriod.FIRST_HALF
-        else:
-            self.period = MatchPeriod.SECOND_HALF
-        logger.info(f"Match {self.match_id} resumed.")
+    def update_clock(self, dt_seconds: float) -> float:
+        """Ticks game timer forward by dt_seconds."""
+        if self.is_active:
+            self.elapsed_seconds += dt_seconds
+        return self.elapsed_seconds
 
-    def update_clock(self, dt: float) -> None:
-        """Updates elapsed match clock by delta seconds if match is active."""
-        if self.period in (MatchPeriod.FIRST_HALF, MatchPeriod.SECOND_HALF):
-            self.elapsed_seconds += max(0.0, dt)
+    # Alias for pipeline integration
+    tick_clock = update_clock
+
+    def process_event(self, event: MatchEvent) -> None:
+        """Processes MatchEvent and updates score counters if event is a GOAL."""
+        self.event_log.append(event)
+        if event.event_type == EventType.GOAL:
+            if event.team == TeamSide.HOME:
+                self.home_score += 1
+            elif event.team == TeamSide.AWAY:
+                self.away_score += 1
+            logger.info(f"Score updated! {self.home_team_name} {self.home_score} - {self.away_score} {self.away_team_name}")
 
     def format_clock(self) -> str:
-        """Formats elapsed match time into MM:SS string."""
+        """Formats elapsed game time into MM:SS string."""
         total_sec = int(self.elapsed_seconds)
         minutes = total_sec // 60
         seconds = total_sec % 60
         return f"{minutes:02d}:{seconds:02d}"
 
-    def process_event(self, event: MatchEvent) -> None:
-        """Consumes a MatchEvent to update scores and event history log."""
-        self.event_log.append(event)
-
-        if event.event_type == EventType.GOAL:
-            if event.team == TeamSide.HOME:
-                self.home_score += 1
-                logger.info(f"⚽ SCORE UPDATE! {self.home_team_name} {self.home_score} - {self.away_score} {self.away_team_name}")
-            elif event.team == TeamSide.AWAY:
-                self.away_score += 1
-                logger.info(f"⚽ SCORE UPDATE! {self.home_team_name} {self.home_score} - {self.away_score} {self.away_team_name}")
-
     def get_state_snapshot(self) -> MatchState:
-        """Returns standard domain MatchState snapshot."""
+        """Generates immutable MatchState snapshot."""
         return MatchState(
             match_id=self.match_id,
             home_score=self.home_score,
             away_score=self.away_score,
-            elapsed_seconds=round(self.elapsed_seconds, 1),
-            is_active=self.period in (MatchPeriod.FIRST_HALF, MatchPeriod.SECOND_HALF),
+            elapsed_seconds=self.elapsed_seconds,
+            current_period=self.current_period.value,
+            is_active=self.is_active,
         )
-
-    def reset(self) -> None:
-        """Resets scoreboard to initial 0-0 state."""
-        self.home_score = 0
-        self.away_score = 0
-        self.elapsed_seconds = 0.0
-        self.period = MatchPeriod.NOT_STARTED
-        self.event_log.clear()
-        logger.info("ScoreboardEngine state reset.")

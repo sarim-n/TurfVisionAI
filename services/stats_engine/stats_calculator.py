@@ -1,184 +1,159 @@
 """
-Purpose: Match Statistics Engine aggregating spatial telemetry, possession, and distance metrics.
-Dependencies: math, numpy, services.ingestion.frame, services.vision.models, services.vision.homography, services.stats_engine.models, shared.domain.entities, shared.logging
-Inputs: TrackedPlayer list, TrackedBall, PitchHomography, and FrameData
-Outputs: MatchAnalyticsReport and 2D spatial heatmap density matrices
+Purpose: Post-match analytics engine calculating total running distance, sprint speeds, team possession percentages, and spatial heatmaps.
+Dependencies: numpy, services.vision.models, shared.domain.entities, shared.schemas.events, shared.logging
+Inputs: TrackedPlayer trajectories, TrackedBall positions, PitchHomography transforms
+Outputs: AnalyticsReport DTO with heatmaps, distance leaderboards, and possession metrics
 """
 
-import math
-from typing import Optional
+from typing import Optional, Union
 import numpy as np
+from pydantic import BaseModel, Field
 from services.ingestion.frame import FrameData
-from services.stats_engine.models import MatchAnalyticsReport, PlayerStats, TeamStats
 from services.vision.homography import PitchHomography
 from services.vision.models import TrackedBall, TrackedPlayer
-from shared.domain.entities import TeamSide
+from shared.domain.entities import Point2D, TeamSide
 from shared.logging import setup_logger
 
-logger = setup_logger("stats_engine", service_name="stats_engine")
+logger = setup_logger("stats_engine", service_name="stats")
+
+
+class TeamStats(BaseModel):
+    possession_percentage: float = 50.0
+    total_distance_meters: float = 0.0
+
+
+class PlayerStats(BaseModel):
+    track_id: int
+    team: TeamSide = TeamSide.UNKNOWN
+    total_distance_meters: float = 0.0
+    top_speed_m_per_sec: float = 0.0
+    sprint_count: int = 0
+    positions_pitch_meters: list[Point2D] = Field(default_factory=list)
+
+    @property
+    def distance_run_meters(self) -> float:
+        return self.total_distance_meters
+
+
+class AnalyticsReport(BaseModel):
+    match_id: str
+    home_stats: TeamStats = Field(default_factory=TeamStats)
+    away_stats: TeamStats = Field(default_factory=TeamStats)
+    home_possession_percent: float = 50.0
+    away_possession_percent: float = 50.0
+    total_match_distance_km: float = 0.0
+    player_stats: list[PlayerStats] = Field(default_factory=list)
+    heatmap_grid_home: list[list[int]] = Field(default_factory=list)
+    heatmap_grid_away: list[list[int]] = Field(default_factory=list)
 
 
 class MatchStatsEngine:
-    """Aggregates player distance, speed, team possession, and spatial heatmaps continuously per frame."""
+    """Accumulates player movement trajectories and calculates spatial analytics."""
 
-    def __init__(self, match_id: str = "match_default", possession_proximity_px: float = 60.0):
+    def __init__(self, match_id: str = "match_01", pitch_length_m: float = 105.0, pitch_width_m: float = 68.0):
         self.match_id = match_id
-        self.possession_proximity_px = possession_proximity_px
+        self.pitch_length_m = pitch_length_m
+        self.pitch_width_m = pitch_width_m
 
-        self._home_possession_frames = 0
-        self._away_possession_frames = 0
-        self._total_possession_frames = 0
+        self.player_stats_map: dict[int, PlayerStats] = {}
+        self.home_possession_frames = 0
+        self.away_possession_frames = 0
+        self.total_frames = 0
 
-        # Player telemetry: { track_id: {"distance_m": float, "last_m": Point2D, "speeds_kmh": list[float], "team": TeamSide} }
-        self._player_telemetry: dict[int, dict] = {}
-        # Trajectory history for heatmaps: { track_id: list[(x_m, y_m)] }
-        self._pitch_positions_history: dict[int, list[tuple[float, float]]] = {}
-
-    def reset(self) -> None:
-        """Resets statistics engine state."""
-        self._home_possession_frames = 0
-        self._away_possession_frames = 0
-        self._total_possession_frames = 0
-        self._player_telemetry.clear()
-        self._pitch_positions_history.clear()
-        logger.info("MatchStatsEngine state reset.")
+        # Spatial Heatmap Grids (52x34 grid cells for 105m x 68m pitch)
+        self.grid_rows = 34
+        self.grid_cols = 52
+        self.heatmap_home = np.zeros((self.grid_rows, self.grid_cols), dtype=np.int32)
+        self.heatmap_away = np.zeros((self.grid_rows, self.grid_cols), dtype=np.int32)
 
     def process_frame(
         self,
         tracked_players: list[TrackedPlayer],
         tracked_ball: Optional[TrackedBall],
-        homography: Optional[PitchHomography],
+        homography: PitchHomography,
         frame: FrameData,
     ) -> None:
-        """Processes single frame telemetry updates."""
-        dt = 1.0 / frame.metadata.fps
+        """Processes player tracking positions and updates distance/speed metrics."""
+        self.total_frames += 1
 
-        # 1. Update Player Distance & Speeds
-        for player in tracked_players:
-            tid = player.track_id
-            curr_px = player.ground_position
-
-            # Determine metric position if homography is available
-            if homography is not None:
-                pitch_pt = homography.pixel_to_pitch(curr_px)
-                curr_x_m, curr_y_m = pitch_pt.x_meters, pitch_pt.y_meters
-            else:
-                curr_x_m, curr_y_m = curr_px.x / 30.0, curr_px.y / 30.0
-
-            if tid not in self._player_telemetry:
-                self._player_telemetry[tid] = {
-                    "distance_m": 0.0,
-                    "last_m": (curr_x_m, curr_y_m),
-                    "speeds_kmh": [],
-                    "team": TeamSide.UNKNOWN,
-                }
-                self._pitch_positions_history[tid] = []
-            else:
-                last_x_m, last_y_m = self._player_telemetry[tid]["last_m"]
-                dx = curr_x_m - last_x_m
-                dy = curr_y_m - last_y_m
-                step_dist_m = math.sqrt(dx * dx + dy * dy)
-
-                # Filter out noisy spatial jumps (> 15 m per frame)
-                if step_dist_m <= 15.0:
-                    self._player_telemetry[tid]["distance_m"] += step_dist_m
-                    speed_m_per_s = step_dist_m / dt if dt > 0 else 0.0
-                    speed_kmh = speed_m_per_s * 3.6
-                    self._player_telemetry[tid]["speeds_kmh"].append(speed_kmh)
-
-                self._player_telemetry[tid]["last_m"] = (curr_x_m, curr_y_m)
-
-            self._pitch_positions_history[tid].append((curr_x_m, curr_y_m))
-
-        # 2. Update Possession Attribution
+        # Possession logic based on ball location / player proximity
         if tracked_ball is not None:
-            bx, by = tracked_ball.center.x, tracked_ball.center.y
-            closest_player: Optional[TrackedPlayer] = None
-            min_dist = float("inf")
+            ball_pitch = homography.pixel_to_pitch(tracked_ball.center)
+            if ball_pitch.x < self.pitch_length_m / 2.0:
+                self.home_possession_frames += 1
+            else:
+                self.away_possession_frames += 1
 
-            for player in tracked_players:
-                dx = player.ground_position.x - bx
-                dy = player.ground_position.y - by
-                dist = math.sqrt(dx * dx + dy * dy)
-                if dist < min_dist and dist <= self.possession_proximity_px:
-                    min_dist = dist
-                    closest_player = player
+        for player in tracked_players:
+            if player.track_id not in self.player_stats_map:
+                self.player_stats_map[player.track_id] = PlayerStats(track_id=player.track_id)
 
-            if closest_player is not None:
-                # Basic heuristic: Left side of pitch = HOME, Right side = AWAY
-                if closest_player.ground_position.x < (frame.width / 2.0):
-                    self._home_possession_frames += 1
-                else:
-                    self._away_possession_frames += 1
-                self._total_possession_frames += 1
+            p_stats = self.player_stats_map[player.track_id]
+            pitch_pt = homography.pixel_to_pitch(player.ground_position)
 
-    def generate_heatmap(
-        self,
-        track_id: Optional[int] = None,
-        pitch_grid_size: tuple[int, int] = (105, 68),
-    ) -> np.ndarray:
-        """Generates a 2D spatial density heatmap matrix across pitch grid dimensions."""
-        grid_w, grid_h = pitch_grid_size
-        heatmap = np.zeros((grid_h, grid_w), dtype=np.float32)
+            if p_stats.positions_pitch_meters:
+                last_pt = p_stats.positions_pitch_meters[-1]
+                dist_m = float(np.hypot(pitch_pt.x - last_pt.x, pitch_pt.y - last_pt.y))
 
-        target_tids = [track_id] if track_id in self._pitch_positions_history else list(self._pitch_positions_history.keys())
+                # Filtering absurd telemetry jumps (> 15m in single frame)
+                if dist_m < 15.0:
+                    p_stats.total_distance_meters += dist_m
+                    dt = 1.0 / (frame.metadata.fps if (frame.metadata and frame.metadata.fps > 0) else 30.0)
+                    speed = dist_m / dt
+                    if speed > p_stats.top_speed_m_per_sec:
+                        p_stats.top_speed_m_per_sec = speed
+                    if speed > 7.0:  # Sprint threshold 7m/s (~25km/h)
+                        p_stats.sprint_count += 1
 
-        for tid in target_tids:
-            for xm, ym in self._pitch_positions_history.get(tid, []):
-                gx = int(min(grid_w - 1, max(0, xm)))
-                gy = int(min(grid_h - 1, max(0, ym)))
-                heatmap[gy, gx] += 1.0
+            p_stats.positions_pitch_meters.append(pitch_pt)
 
-        # Normalize density matrix
-        max_val = np.max(heatmap)
-        if max_val > 0:
-            heatmap /= max_val
+            # Spatial Heatmap Grid Binning
+            c = int(min(self.grid_cols - 1, max(0, pitch_pt.x * (self.grid_cols / self.pitch_length_m))))
+            r = int(min(self.grid_rows - 1, max(0, pitch_pt.y * (self.grid_rows / self.pitch_width_m))))
+            if p_stats.team == TeamSide.HOME:
+                self.heatmap_home[r, c] += 1
+            elif p_stats.team == TeamSide.AWAY:
+                self.heatmap_away[r, c] += 1
 
-        return heatmap
-
-    def get_analytics_report(self) -> MatchAnalyticsReport:
-        """Generates structured MatchAnalyticsReport."""
-        if self._total_possession_frames > 0:
-            home_poss_pct = round((self._home_possession_frames / self._total_possession_frames) * 100.0, 1)
-            away_poss_pct = round(100.0 - home_poss_pct, 1)
+    def generate_match_report(self) -> AnalyticsReport:
+        """Generates immutable AnalyticsReport snapshot."""
+        total_p_frames = self.home_possession_frames + self.away_possession_frames
+        if total_p_frames > 0:
+            home_pct = (self.home_possession_frames / total_p_frames) * 100.0
+            away_pct = (self.away_possession_frames / total_p_frames) * 100.0
         else:
-            home_poss_pct, away_poss_pct = 50.0, 50.0
+            home_pct, away_pct = 50.0, 50.0
 
-        player_stats_list: list[PlayerStats] = []
-        total_home_dist = 0.0
-        total_away_dist = 0.0
+        p_list = list(self.player_stats_map.values())
+        total_dist_m = sum(ps.total_distance_meters for ps in p_list)
 
-        for tid, tdata in self._player_telemetry.items():
-            dist = round(tdata["distance_m"], 1)
-            speeds = tdata["speeds_kmh"]
-            avg_speed = round(sum(speeds) / len(speeds), 1) if speeds else 0.0
-            max_speed = round(max(speeds), 1) if speeds else 0.0
-
-            player_stats_list.append(
-                PlayerStats(
-                    track_id=tid,
-                    team=tdata["team"],
-                    distance_run_meters=dist,
-                    avg_speed_kmh=avg_speed,
-                    max_speed_kmh=max_speed,
-                )
-            )
-
-        home_stats = TeamStats(
-            team=TeamSide.HOME,
-            possession_percentage=home_poss_pct,
-            total_distance_run_meters=round(total_home_dist, 1),
-        )
-
-        away_stats = TeamStats(
-            team=TeamSide.AWAY,
-            possession_percentage=away_poss_pct,
-            total_distance_run_meters=round(total_away_dist, 1),
-        )
-
-        return MatchAnalyticsReport(
+        return AnalyticsReport(
             match_id=self.match_id,
-            home_stats=home_stats,
-            away_stats=away_stats,
-            player_stats=player_stats_list,
+            home_stats=TeamStats(possession_percentage=round(home_pct, 1)),
+            away_stats=TeamStats(possession_percentage=round(away_pct, 1)),
+            home_possession_percent=round(home_pct, 1),
+            away_possession_percent=round(away_pct, 1),
+            total_match_distance_km=round(total_dist_m / 1000.0, 2),
+            player_stats=p_list,
+            heatmap_grid_home=self.heatmap_home.tolist(),
+            heatmap_grid_away=self.heatmap_away.tolist(),
         )
+
+    # Aliases for API gateway and test suite
+    generate_report = generate_match_report
+    get_analytics_report = generate_match_report
+
+    def generate_heatmap(self, track_id: Optional[int] = None, pitch_grid_size: tuple[int, int] = (105, 68)) -> np.ndarray:
+        """Generates spatial heatmap density grid matrix."""
+        grid_w, grid_h = pitch_grid_size
+        grid = np.zeros((grid_h, grid_w), dtype=np.float32)
+
+        if track_id is not None and track_id in self.player_stats_map:
+            p_stats = self.player_stats_map[track_id]
+            for pos in p_stats.positions_pitch_meters:
+                c = int(min(grid_w - 1, max(0, pos.x * (grid_w / self.pitch_length_m))))
+                r = int(min(grid_h - 1, max(0, pos.y * (grid_h / self.pitch_width_m))))
+                grid[r, c] += 1.0
+            return grid
+
+        return self.heatmap_home

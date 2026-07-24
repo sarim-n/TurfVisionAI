@@ -1,178 +1,169 @@
 """
-Purpose: Player Tracking Engine for Multi-Object Tracking (MOT) across video frames.
+Purpose: Player Tracking Engine managing multi-object tracking (MOT) and persistent track IDs.
 Dependencies: numpy, services.vision.models, shared.domain.entities, shared.logging
-Inputs: PlayerDetectionResult and FrameData
-Outputs: PlayerTrackingFrameResult containing persistent TrackedPlayer entities
+Inputs: List of DetectedObject instances or PlayerDetectionResult per frame
+Outputs: PlayerTrackingFrameResult containing active TrackedPlayer instances
 """
 
+import time
+from typing import Any, Optional, Union
 import numpy as np
-from services.ingestion.frame import FrameData
-from services.vision.models import PlayerDetectionResult, PlayerTrackingFrameResult, TrackedPlayer
-from shared.domain.entities import BoundingBox, Point2D
+from services.vision.models import DetectedObject, PlayerDetectionResult, PlayerTrackingFrameResult, TrackedPlayer
+from shared.domain.entities import BoundingBox, Point2D, TrackedObjectType
 from shared.logging import setup_logger
 
 logger = setup_logger("player_tracker", service_name="vision")
 
 
-def compute_iou(boxA: BoundingBox, boxB: BoundingBox) -> float:
-    """Computes Intersection over Union (IoU) between two bounding boxes."""
-    xA = max(boxA.x1, boxB.x1)
-    yA = max(boxA.y1, boxB.y1)
-    xB = min(boxA.x2, boxB.x2)
-    yB = min(boxA.y2, boxB.y2)
+def compute_iou(box1: BoundingBox, box2: BoundingBox) -> float:
+    """Computes IoU overlap ratio between two bounding boxes."""
+    x1 = max(box1.x1, box2.x1)
+    y1 = max(box1.y1, box2.y1)
+    x2 = min(box1.x2, box2.x2)
+    y2 = min(box1.y2, box2.y2)
 
-    inter_width = max(0.0, xB - xA)
-    inter_height = max(0.0, yB - yA)
-    inter_area = inter_width * inter_height
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    area1 = (box1.x2 - box1.x1) * (box1.y2 - box1.y1)
+    area2 = (box2.x2 - box2.x1) * (box2.y2 - box2.y1)
+    union = area1 + area2 - intersection
+    return (intersection / union) if union > 0 else 0.0
 
-    boxA_area = (boxA.x2 - boxA.x1) * (boxA.y2 - boxA.y1)
-    boxB_area = (boxB.x2 - boxB.x1) * (boxB.y2 - boxB.y1)
 
-    union_area = boxA_area + boxB_area - inter_area
-    if union_area <= 0:
-        return 0.0
+class TrackState:
+    """Internal state representation for a single tracked player."""
 
-    return inter_area / union_area
+    def __init__(self, track_id: int, initial_bbox: BoundingBox, initial_ground_pos: Point2D):
+        self.track_id = track_id
+        self.bbox = initial_bbox
+        self.ground_position = initial_ground_pos
+        self.trajectory_history: list[Point2D] = [initial_ground_pos]
+        self.disappeared_frames = 0
+        self.total_tracked_frames = 1
 
 
 class PlayerTracker:
-    """Multi-Object Player Tracker maintaining persistent track IDs and motion trajectory tails."""
+    """Multi-Object Tracker (MOT) assigning persistent track IDs using IoU matching."""
 
-    def __init__(self, iou_threshold: float = 0.3, max_history_len: int = 30, max_disappeared: int = 15):
+    def __init__(self, max_disappeared: int = 30, iou_threshold: float = 0.3, max_history_len: int = 30):
+        self.max_disappeared = max_disappeared
         self.iou_threshold = iou_threshold
         self.max_history_len = max_history_len
-        self.max_disappeared = max_disappeared
+        self.next_track_id = 1
+        self.tracks: dict[int, TrackState] = {}
 
-        self._next_track_id = 1
-        self._active_tracks: dict[int, dict] = {}
-        # Format: { track_id: {"bbox": BoundingBox, "history": list[Point2D], "disappeared": int, "active_count": int} }
-
-    def reset(self) -> None:
-        """Resets tracking state and ID counters."""
-        self._next_track_id = 1
-        self._active_tracks.clear()
-        logger.info("PlayerTracker state reset.")
+    def _compute_iou_matrix(
+        self, existing_boxes: list[BoundingBox], new_boxes: list[BoundingBox]
+    ) -> np.ndarray:
+        """Computes IoU cost matrix between existing tracks and new detection bounding boxes."""
+        matrix = np.zeros((len(existing_boxes), len(new_boxes)), dtype=np.float32)
+        for i, b1 in enumerate(existing_boxes):
+            for j, b2 in enumerate(new_boxes):
+                matrix[i, j] = compute_iou(b1, b2)
+        return matrix
 
     def update(
-        self, detection_result: PlayerDetectionResult, frame: FrameData
+        self, detections: Union[list[DetectedObject], PlayerDetectionResult], frame: Optional[Any] = None
     ) -> PlayerTrackingFrameResult:
-        """Updates tracker state with new frame detections and returns persistent TrackedPlayer instances."""
-        new_detections = detection_result.detections
+        """Updates internal tracks with new detections for the frame."""
+        det_list = detections.detections if isinstance(detections, PlayerDetectionResult) else detections
+        player_detections = [d for d in det_list if getattr(d, "object_type", None) == TrackedObjectType.PLAYER]
 
-        # If no active tracks exist, initialize new tracks for all detections
-        if not self._active_tracks:
-            for det in new_detections:
-                track_id = self._next_track_id
-                self._next_track_id += 1
-                ground_pt = det.bbox.bottom_center
-                self._active_tracks[track_id] = {
-                    "bbox": det.bbox,
-                    "history": [ground_pt],
-                    "disappeared": 0,
-                    "active_count": 1,
-                    "confidence": det.confidence,
-                }
-
-            tracked_players = [
-                TrackedPlayer(
-                    track_id=tid,
-                    bbox=tdata["bbox"],
-                    ground_position=tdata["bbox"].bottom_center,
-                    trajectory_history=list(tdata["history"]),
-                    confidence=tdata["confidence"],
-                    active_frames=tdata["active_count"],
+        if len(self.tracks) == 0:
+            # First frame initialization
+            for det in player_detections:
+                ground_pos = Point2D(x=(det.bbox.x1 + det.bbox.x2) / 2.0, y=det.bbox.y2)
+                track = TrackState(
+                    track_id=self.next_track_id,
+                    initial_bbox=det.bbox,
+                    initial_ground_pos=ground_pos,
                 )
-                for tid, tdata in self._active_tracks.items()
-            ]
-            return PlayerTrackingFrameResult(
-                frame_number=frame.frame_number,
-                timestamp_seconds=frame.timestamp_seconds,
-                tracked_players=tracked_players,
-            )
+                self.tracks[self.next_track_id] = track
+                self.next_track_id += 1
+        else:
+            existing_track_ids = list(self.tracks.keys())
+            existing_boxes = [self.tracks[tid].bbox for tid in existing_track_ids]
+            new_boxes = [det.bbox for det in player_detections]
 
-        # Match existing tracks with new detections using Greedy IoU Assignment
-        track_ids = list(self._active_tracks.keys())
-        matched_track_ids = set()
-        matched_detection_indices = set()
+            if len(new_boxes) > 0 and len(existing_boxes) > 0:
+                iou_matrix = self._compute_iou_matrix(existing_boxes, new_boxes)
 
-        if new_detections and track_ids:
-            # Build IoU matrix
-            iou_matrix = np.zeros((len(track_ids), len(new_detections)), dtype=np.float32)
-            for i, tid in enumerate(track_ids):
-                for j, det in enumerate(new_detections):
-                    iou_matrix[i, j] = compute_iou(self._active_tracks[tid]["bbox"], det.bbox)
+                # Greedy bipartite matching
+                matched_track_indices = set()
+                matched_det_indices = set()
 
-            # Greedy matching
-            while True:
-                if iou_matrix.size == 0:
-                    break
-                max_val = np.max(iou_matrix)
-                if max_val < self.iou_threshold:
-                    break
-                i, j = np.unravel_index(np.argmax(iou_matrix), iou_matrix.shape)
-                tid = track_ids[i]
-                if tid not in matched_track_ids and j not in matched_detection_indices:
-                    matched_track_ids.add(tid)
-                    matched_detection_indices.add(j)
+                # Sort by highest IoU matches
+                flat_matches = []
+                for i in range(len(existing_boxes)):
+                    for j in range(len(new_boxes)):
+                        flat_matches.append((iou_matrix[i, j], i, j))
+                flat_matches.sort(key=lambda x: x[0], reverse=True)
 
-                    # Update track state
-                    det = new_detections[j]
-                    ground_pt = det.bbox.bottom_center
-                    history = self._active_tracks[tid]["history"]
-                    history.append(ground_pt)
-                    if len(history) > self.max_history_len:
-                        history.pop(0)
+                for iou_val, i, j in flat_matches:
+                    if iou_val < self.iou_threshold:
+                        break
+                    if i in matched_track_indices or j in matched_det_indices:
+                        continue
 
-                    self._active_tracks[tid]["bbox"] = det.bbox
-                    self._active_tracks[tid]["history"] = history
-                    self._active_tracks[tid]["disappeared"] = 0
-                    self._active_tracks[tid]["active_count"] += 1
-                    self._active_tracks[tid]["confidence"] = det.confidence
+                    matched_track_indices.add(i)
+                    matched_det_indices.add(j)
 
-                iou_matrix[i, :] = -1.0
-                iou_matrix[:, j] = -1.0
+                    tid = existing_track_ids[i]
+                    det = player_detections[j]
+                    ground_pos = Point2D(x=(det.bbox.x1 + det.bbox.x2) / 2.0, y=det.bbox.y2)
 
-        # Handle unmatched detections (spawn new track IDs)
-        for j, det in enumerate(new_detections):
-            if j not in matched_detection_indices:
-                track_id = self._next_track_id
-                self._next_track_id += 1
-                ground_pt = det.bbox.bottom_center
-                self._active_tracks[track_id] = {
-                    "bbox": det.bbox,
-                    "history": [ground_pt],
-                    "disappeared": 0,
-                    "active_count": 1,
-                    "confidence": det.confidence,
-                }
+                    self.tracks[tid].bbox = det.bbox
+                    self.tracks[tid].ground_position = ground_pos
+                    self.tracks[tid].trajectory_history.append(ground_pos)
+                    if len(self.tracks[tid].trajectory_history) > self.max_history_len:
+                        self.tracks[tid].trajectory_history.pop(0)
 
-        # Handle unmatched tracks (increment disappeared counter and purge expired tracks)
-        expired_track_ids = []
-        for tid in track_ids:
-            if tid not in matched_track_ids:
-                self._active_tracks[tid]["disappeared"] += 1
-                if self._active_tracks[tid]["disappeared"] > self.max_disappeared:
-                    expired_track_ids.append(tid)
+                    self.tracks[tid].disappeared_frames = 0
+                    self.tracks[tid].total_tracked_frames += 1
 
-        for tid in expired_track_ids:
-            del self._active_tracks[tid]
+                # Unmatched existing tracks -> increment disappeared_frames
+                for i, tid in enumerate(existing_track_ids):
+                    if i not in matched_track_indices:
+                        self.tracks[tid].disappeared_frames += 1
 
-        # Construct final TrackedPlayer list
-        tracked_players = [
-            TrackedPlayer(
-                track_id=tid,
-                bbox=tdata["bbox"],
-                ground_position=tdata["bbox"].bottom_center,
-                trajectory_history=list(tdata["history"]),
-                confidence=tdata["confidence"],
-                active_frames=tdata["active_count"],
-            )
-            for tid, tdata in self._active_tracks.items()
-            if tdata["disappeared"] == 0  # Only return active visible tracks
+                # Unmatched new detections -> assign new track IDs
+                for j, det in enumerate(player_detections):
+                    if j not in matched_det_indices:
+                        ground_pos = Point2D(x=(det.bbox.x1 + det.bbox.x2) / 2.0, y=det.bbox.y2)
+                        track = TrackState(
+                            track_id=self.next_track_id,
+                            initial_bbox=det.bbox,
+                            initial_ground_pos=ground_pos,
+                        )
+                        self.tracks[self.next_track_id] = track
+                        self.next_track_id += 1
+            else:
+                # No new detections -> increment disappeared_frames
+                for tid in existing_track_ids:
+                    self.tracks[tid].disappeared_frames += 1
+
+        # Purge dead tracks exceeding max_disappeared
+        dead_track_ids = [
+            tid for tid, track in self.tracks.items() if track.disappeared_frames > self.max_disappeared
         ]
+        for tid in dead_track_ids:
+            del self.tracks[tid]
+
+        # Convert internal tracks to TrackedPlayer DTOs
+        active_tracked_players: list[TrackedPlayer] = []
+        for tid, track in self.tracks.items():
+            if track.disappeared_frames == 0:
+                active_tracked_players.append(
+                    TrackedPlayer(
+                        track_id=tid,
+                        bbox=track.bbox,
+                        ground_position=track.ground_position,
+                        trajectory_history=list(track.trajectory_history),
+                    )
+                )
 
         return PlayerTrackingFrameResult(
-            frame_number=frame.frame_number,
-            timestamp_seconds=frame.timestamp_seconds,
-            tracked_players=tracked_players,
+            frame_number=0,
+            timestamp_seconds=0.0,
+            tracked_players=active_tracked_players,
+            processing_time_ms=0.0,
         )

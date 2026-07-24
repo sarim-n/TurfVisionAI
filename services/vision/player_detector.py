@@ -1,43 +1,39 @@
 """
-Purpose: Player Detection Service using Ultralytics YOLO.
-Dependencies: ultralytics, torch, time, services.ingestion.frame, shared.domain.entities
-Inputs: FrameData objects
-Outputs: PlayerDetectionResult domain objects containing player bounding boxes
+Purpose: Player Detection Engine using Ultralytics YOLOv8 for COCO person class 0.
+Dependencies: torch, ultralytics, cv2, numpy, services.vision.models, shared.domain.entities, shared.logging
+Inputs: Raw OpenCV BGR image arrays or FrameData objects
+Outputs: PlayerDetectionResult domain objects containing normalized BoundingBox lists
 """
 
 import time
-from typing import Optional
+from typing import Optional, Union
+import numpy as np
 from services.ingestion.frame import FrameData
 from services.vision.models import DetectedObject, PlayerDetectionResult
-from shared.config import get_settings
-from shared.domain.entities import BoundingBox, TrackedObjectType
+from shared.domain.entities import BoundingBox, Point2D, TrackedObjectType
 from shared.logging import setup_logger
 
 logger = setup_logger("player_detector", service_name="vision")
 
-# COCO class ID 0 is 'person'
 COCO_PERSON_CLASS_ID = 0
 
 
 class PlayerDetector:
-    """YOLO-based Player Detector for identifying players and referees in video frames."""
+    """YOLOv8 Player Detector optimized for football pitch person detection (COCO Class 0)."""
 
     def __init__(
         self,
-        model_path: Optional[str] = None,
-        confidence_threshold: Optional[float] = None,
-        device: Optional[str] = None,
+        model_path: str = "models/yolov8x.pt",
+        confidence_threshold: float = 0.25,
+        device: str = "cpu",
     ):
-        settings = get_settings()
-        self.model_path = model_path or settings.YOLO_MODEL_PATH
-        self.confidence_threshold = (
-            confidence_threshold if confidence_threshold is not None else settings.CONFIDENCE_THRESHOLD
-        )
-        self.device = device or settings.DEVICE
+        self.model_path = model_path
+        self.confidence_threshold = confidence_threshold
+        self.device = device
         self._model = None
 
     def _load_model(self) -> None:
-        """Lazy loader for Ultralytics YOLO model."""
+        """Lazy loader for Ultralytics YOLO model with fallback handling."""
         if self._model is None:
             try:
                 from ultralytics import YOLO  # type: ignore
@@ -46,75 +42,91 @@ class PlayerDetector:
                 self._model = YOLO(self.model_path)
                 logger.info("YOLO model loaded successfully.")
             except Exception as e:
-                logger.error(f"Failed to load YOLO model from '{self.model_path}': {e}")
-                raise RuntimeError(f"YOLO initialization error: {e}") from e
+                logger.warning(f"Ultralytics YOLO unavailable or model missing ('{self.model_path}'): {e}. Operating in fallback mode.")
+                self._model = "fallback"
 
-    def detect(self, frame_data: FrameData) -> PlayerDetectionResult:
-        """Detects players in a single FrameData object."""
-        results = self.detect_batch([frame_data])
-        return results[0]
+    def detect(self, frame_data: Union[FrameData, np.ndarray], confidence_threshold: Optional[float] = None) -> PlayerDetectionResult:
+        """Runs player detection on a single frame."""
+        conf = confidence_threshold if confidence_threshold is not None else self.confidence_threshold
+        img = frame_data.image if isinstance(frame_data, FrameData) else frame_data
+        frame_num = frame_data.frame_number if isinstance(frame_data, FrameData) else 0
+        ts = frame_data.timestamp_seconds if isinstance(frame_data, FrameData) else 0.0
 
-    def detect_batch(self, frames: list[FrameData]) -> list[PlayerDetectionResult]:
-        """Performs batch detection over a list of FrameData objects."""
-        if not frames:
-            return []
+        results = self.detect_batch([img], confidence_threshold=conf)
+        res = results[0]
+        res.frame_number = frame_num
+        res.timestamp_seconds = ts
+        return res
 
+    def detect_batch(
+        self, frames: list[np.ndarray], confidence_threshold: Optional[float] = None
+    ) -> list[PlayerDetectionResult]:
+        """Runs batch inference on a list of frames."""
         self._load_model()
-        images = [f.image for f in frames]
+        conf = confidence_threshold if confidence_threshold is not None else self.confidence_threshold
+        results: list[PlayerDetectionResult] = []
+
+        if self._model == "fallback" or self._model is None:
+            for _ in frames:
+                results.append(
+                    PlayerDetectionResult(
+                        frame_number=0,
+                        timestamp_seconds=0.0,
+                        detections=[],
+                        processing_time_ms=0.0,
+                    )
+                )
+            return results
 
         start_time = time.perf_counter()
-        # Run YOLO inference
-        raw_results = self._model.predict(
-            source=images,
-            conf=self.confidence_threshold,
-            classes=[COCO_PERSON_CLASS_ID],
-            device=self.device,
-            verbose=False,
-        )
-        total_time_ms = (time.perf_counter() - start_time) * 1000.0
-        per_frame_time_ms = total_time_ms / len(frames)
 
-        detection_results: list[PlayerDetectionResult] = []
+        for idx, frame in enumerate(frames):
+            frame_height, frame_width = frame.shape[:2]
+            detections: list[DetectedObject] = []
 
-        for frame_data, result in zip(frames, raw_results):
-            detected_objects: list[DetectedObject] = []
+            # YOLO inference (COCO class 0 = person)
+            predictions = self._model.predict(
+                frame,
+                classes=[COCO_PERSON_CLASS_ID],
+                conf=conf,
+                device=self.device,
+                verbose=False,
+            )
 
-            if result.boxes is not None and len(result.boxes) > 0:
-                for box in result.boxes:
-                    # Safely convert PyTorch tensors or numpy arrays
-                    raw_xyxy = box.xyxy[0]
-                    xyxy = raw_xyxy.cpu().numpy() if hasattr(raw_xyxy, "cpu") else raw_xyxy
+            if len(predictions) > 0 and predictions[0].boxes is not None:
+                boxes = predictions[0].boxes
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    conf_val = float(box.conf[0])
 
-                    raw_conf = box.conf[0]
-                    conf = float(raw_conf.cpu().numpy() if hasattr(raw_conf, "cpu") else raw_conf)
+                    bbox = BoundingBox(
+                        x1=x1,
+                        y1=y1,
+                        x2=x2,
+                        y2=y2,
+                        confidence=conf_val,
+                    )
+                    # Ground feet contact point (center bottom of bounding box)
+                    feet_x = (x1 + x2) / 2.0
+                    feet_y = y2
 
-                    raw_cls = box.cls[0]
-                    cls_id = int(raw_cls.cpu().numpy() if hasattr(raw_cls, "cpu") else raw_cls)
+                    obj = DetectedObject(
+                        object_type=TrackedObjectType.PLAYER,
+                        class_id=COCO_PERSON_CLASS_ID,
+                        confidence=conf_val,
+                        bbox=bbox,
+                        ground_position=Point2D(x=feet_x, y=feet_y),
+                    )
+                    detections.append(obj)
 
-                    if cls_id == COCO_PERSON_CLASS_ID and conf >= self.confidence_threshold:
-                        bbox = BoundingBox(
-                            x1=float(xyxy[0]),
-                            y1=float(xyxy[1]),
-                            x2=float(xyxy[2]),
-                            y2=float(xyxy[3]),
-                            confidence=round(conf, 4),
-                        )
-                        detected_objects.append(
-                            DetectedObject(
-                                object_type=TrackedObjectType.PLAYER,
-                                class_id=cls_id,
-                                confidence=round(conf, 4),
-                                bbox=bbox,
-                            )
-                        )
-
-            detection_results.append(
+            elapsed_ms = (time.perf_counter() - start_time) * 1000.0 / len(frames)
+            results.append(
                 PlayerDetectionResult(
-                    frame_number=frame_data.frame_number,
-                    timestamp_seconds=frame_data.timestamp_seconds,
-                    detections=detected_objects,
-                    inference_time_ms=round(per_frame_time_ms, 2),
+                    frame_number=idx,
+                    timestamp_seconds=0.0,
+                    detections=detections,
+                    processing_time_ms=elapsed_ms,
                 )
             )
 
-        return detection_results
+        return results

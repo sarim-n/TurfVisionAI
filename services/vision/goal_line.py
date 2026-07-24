@@ -22,7 +22,32 @@ class GoalLineDetector:
         self.goals: dict[GoalSide, GoalPostGeometry] = {
             GoalSide.HOME_GOAL: home_goal,
             GoalSide.AWAY_GOAL: away_goal,
+            GoalSide.LEFT: home_goal,
+            GoalSide.RIGHT: away_goal,
         }
+
+    @property
+    def left_goal(self) -> GoalPostGeometry:
+        return self.goals[GoalSide.HOME_GOAL]
+
+    @property
+    def right_goal(self) -> GoalPostGeometry:
+        return self.goals[GoalSide.AWAY_GOAL]
+
+    def check_ball_position(
+        self, ball_position: Optional[Point2D], goal_side: GoalSide = GoalSide.HOME_GOAL
+    ) -> GoalLineCheckResult:
+        """Alias helper for evaluating single Point2D ball position."""
+        if ball_position is None:
+            return GoalLineCheckResult(
+                goal_side=goal_side,
+                is_ball_in_goal_mouth=False,
+                is_ball_past_goal_line=False,
+                signed_distance_meters=0.0,
+                perpendicular_distance_px=0.0,
+            )
+        dummy_tb = TrackedBall(center=ball_position)
+        return self.check_goal_line_crossing(dummy_tb, goal_side)
 
     def check_goal_line_crossing(
         self,
@@ -32,7 +57,7 @@ class GoalLineDetector:
         ball_radius_px: float = 10.0,
     ) -> GoalLineCheckResult:
         """Evaluates signed distance and goal line crossing state for a tracked ball."""
-        goal_geom = self.goals[goal_side]
+        goal_geom = self.goals.get(goal_side, self.goals[GoalSide.HOME_GOAL])
         p1 = goal_geom.left_post
         p2 = goal_geom.right_post
 
@@ -70,7 +95,7 @@ class GoalLineDetector:
         # Compute metric distance if homography is available
         if homography is not None and tracked_ball.pitch_position is not None:
             # Metric signed distance (meters)
-            if goal_side == GoalSide.HOME_GOAL:
+            if goal_side in (GoalSide.HOME_GOAL, GoalSide.LEFT):
                 # Home goal at x = 0.0m -> past line if x < 0.0 or x > length
                 dist_meters = -tracked_ball.pitch_position.x_meters
             else:
@@ -86,6 +111,7 @@ class GoalLineDetector:
             is_ball_past_goal_line=is_past_line,
             signed_distance_meters=dist_meters,
             perpendicular_distance_px=round(perpendicular_dist, 2),
+            ball_position=tracked_ball.center,
         )
 
     @classmethod
