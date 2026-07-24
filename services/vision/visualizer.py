@@ -1,17 +1,19 @@
 """
-Purpose: Visualization helper for rendering player detections, ball detections, player tracks, ball tracking vectors, and 2D tactical bird's eye view pitch maps on OpenCV frames.
-Dependencies: cv2, numpy, services.vision.models, services.vision.homography
-Inputs: Raw image frame, Player/Ball tracking results, PitchHomography
+Purpose: Visualization helper for rendering player detections, ball detections, player tracks, ball tracking vectors, 2D tactical maps, and goal line wireframes on OpenCV frames.
+Dependencies: cv2, numpy, services.vision.models, services.vision.homography, services.vision.goal_line
+Inputs: Raw image frame, tracking results, GoalLineDetector
 Outputs: Annotated BGR image frame
 """
 
 from typing import Optional
 import cv2
 import numpy as np
+from services.vision.goal_line import GoalLineDetector
 from services.vision.homography import PitchHomography
 from services.vision.models import (
     BallDetectionResult,
     BallTrackingFrameResult,
+    GoalSide,
     PlayerDetectionResult,
     PlayerTrackingFrameResult,
     TrackedBall,
@@ -260,3 +262,41 @@ def draw_birds_eye_view(
         cv2.circle(canvas, (bx, by), 8, (0, 0, 0), 2)
 
     return canvas
+
+
+def draw_goal_lines(
+    image: np.ndarray,
+    goal_detector: GoalLineDetector,
+    line_color: tuple[int, int, int] = (0, 0, 255),
+) -> np.ndarray:
+    """Draws goal post geometry lines and goal line plane segments on OpenCV image frames."""
+    annotated = image.copy()
+
+    for goal_side in [GoalSide.HOME_GOAL, GoalSide.AWAY_GOAL]:
+        goal_geom = goal_detector.goals[goal_side]
+        p1 = (int(goal_geom.left_post.x), int(goal_geom.left_post.y))
+        p2 = (int(goal_geom.right_post.x), int(goal_geom.right_post.y))
+
+        # Goal Line Plane
+        cv2.line(annotated, p1, p2, line_color, 3)
+
+        # Goal Post Dots
+        cv2.circle(annotated, p1, 6, (255, 255, 255), -1)
+        cv2.circle(annotated, p2, 6, (255, 255, 255), -1)
+
+        # Label badge
+        label = "HOME GOAL" if goal_side == GoalSide.HOME_GOAL else "AWAY GOAL"
+        mid_x = (p1[0] + p2[0]) // 2
+        mid_y = (p1[1] + p2[1]) // 2
+        cv2.putText(
+            annotated,
+            label,
+            (mid_x - 30, mid_y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return annotated

@@ -1,13 +1,19 @@
 """
-Purpose: Data models for object detection, tracking, and spatial pitch coordinates in the vision service.
-Dependencies: pydantic, shared.domain.entities
-Inputs: Raw model predictions, tracking updates, and pitch calibrations
-Outputs: Validated domain models for vision pipeline and camera calibration
+Purpose: Data models for object detection, tracking, spatial pitch coordinates, and goal line geometry in the vision service.
+Dependencies: pydantic, enum, shared.domain.entities
+Inputs: Raw model predictions, tracking updates, pitch calibrations, and goal post geometry
+Outputs: Validated domain models for vision pipeline and spatial goal line checks
 """
 
+from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field
 from shared.domain.entities import BoundingBox, Point2D, TrackedObjectType
+
+
+class GoalSide(str, Enum):
+    HOME_GOAL = "home_goal"
+    AWAY_GOAL = "away_goal"
 
 
 class PitchDimensions(BaseModel):
@@ -22,6 +28,25 @@ class PitchPoint(BaseModel):
     """2D Real-World Coordinate on the football pitch in meters (0,0 is top-left corner)."""
     x_meters: float = Field(..., description="X coordinate along pitch length (0 to length_meters)")
     y_meters: float = Field(..., description="Y coordinate along pitch width (0 to width_meters)")
+
+
+class GoalPostGeometry(BaseModel):
+    """Defines spatial coordinates of goal posts and crossbar for a specific goal side."""
+    goal_side: GoalSide
+    left_post: Point2D = Field(..., description="Left goal post base pixel coordinate")
+    right_post: Point2D = Field(..., description="Right goal post base pixel coordinate")
+    crossbar_height_px: float = Field(default=100.0, description="Goal crossbar height in pixels")
+    width_meters: float = Field(default=7.32, description="Official goal mouth width in meters")
+    height_meters: float = Field(default=2.44, description="Official goal height in meters")
+
+
+class GoalLineCheckResult(BaseModel):
+    """Output of spatial goal line evaluation for a tracked ball."""
+    goal_side: GoalSide
+    is_ball_in_goal_mouth: bool = Field(..., description="True if ball center is within left/right goal post width")
+    is_ball_past_goal_line: bool = Field(..., description="True if 100% of ball has crossed goal line plane into net")
+    signed_distance_meters: float = Field(..., description="Signed perpendicular distance in meters (+ is inside net)")
+    perpendicular_distance_px: float = Field(..., description="Perpendicular distance in pixels")
 
 
 class DetectedObject(BaseModel):
