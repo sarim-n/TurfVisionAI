@@ -1,13 +1,13 @@
 """
-Purpose: Data models for object detection results in the vision service.
+Purpose: Data models for object detection and tracking results in the vision service.
 Dependencies: pydantic, shared.domain.entities
-Inputs: Raw model predictions
-Outputs: Validated DetectedObject, PlayerDetectionResult, and BallDetectionResult domain models
+Inputs: Raw model predictions & tracker updates
+Outputs: Validated domain models for player detection, ball detection, and player tracking
 """
 
 from typing import Optional
 from pydantic import BaseModel, Field
-from shared.domain.entities import BoundingBox, TrackedObjectType
+from shared.domain.entities import BoundingBox, Point2D, TrackedObjectType
 
 
 class DetectedObject(BaseModel):
@@ -39,3 +39,26 @@ class BallDetectionResult(BaseModel):
     ball_object: Optional[DetectedObject] = None
     candidates: list[DetectedObject] = Field(default_factory=list)
     inference_time_ms: float = Field(default=0.0, description="Inference execution duration in ms")
+
+
+class TrackedPlayer(BaseModel):
+    """Represents a unique tracked player across time."""
+    track_id: int = Field(..., description="Unique persistent tracking ID")
+    bbox: BoundingBox = Field(..., description="Current frame bounding box")
+    ground_position: Point2D = Field(..., description="Current bottom-center ground location")
+    trajectory_history: list[Point2D] = Field(
+        default_factory=list, description="Historical ground positions (motion tail)"
+    )
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    active_frames: int = Field(default=1, description="Number of consecutive active frames tracked")
+
+
+class PlayerTrackingFrameResult(BaseModel):
+    """Aggregated player tracking output for a single frame."""
+    frame_number: int
+    timestamp_seconds: float
+    tracked_players: list[TrackedPlayer] = Field(default_factory=list)
+
+    @property
+    def active_player_count(self) -> int:
+        return len(self.tracked_players)

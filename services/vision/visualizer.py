@@ -1,13 +1,13 @@
 """
-Purpose: Visualization helper for rendering player and ball detection annotations on OpenCV frames.
+Purpose: Visualization helper for rendering player detections, ball detections, and player tracking trajectories on OpenCV frames.
 Dependencies: cv2, numpy, services.vision.models
-Inputs: Raw image frame, PlayerDetectionResult / BallDetectionResult
+Inputs: Raw image frame, PlayerDetectionResult / BallDetectionResult / PlayerTrackingFrameResult
 Outputs: Annotated BGR image frame
 """
 
 import cv2
 import numpy as np
-from services.vision.models import BallDetectionResult, PlayerDetectionResult
+from services.vision.models import BallDetectionResult, PlayerDetectionResult, PlayerTrackingFrameResult
 
 
 def draw_player_detections(
@@ -80,5 +80,49 @@ def draw_ball_detections(
             1,
             cv2.LINE_AA,
         )
+
+    return annotated
+
+
+def draw_player_tracks(
+    image: np.ndarray,
+    result: PlayerTrackingFrameResult,
+    draw_tail: bool = True,
+) -> np.ndarray:
+    """Draws tracked players with persistent ID badges (#X) and ground motion trajectory tail lines."""
+    annotated = image.copy()
+
+    for player in result.tracked_players:
+        bbox = player.bbox
+        x1, y1, x2, y2 = int(bbox.x1), int(bbox.y1), int(bbox.x2), int(bbox.y2)
+
+        # Generate consistent color based on track_id
+        np.random.seed(player.track_id)
+        color = tuple(map(int, np.random.randint(50, 255, size=3)))
+
+        # Draw player bounding box
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+
+        # Draw Track ID badge (#1, #2, etc.)
+        label_text = f"#{player.track_id}"
+        (w, h), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        cv2.rectangle(annotated, (x1, y1 - h - 6), (x1 + w + 6, y1), color, -1)
+        cv2.putText(
+            annotated,
+            label_text,
+            (x1 + 3, y1 - 3),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+        # Draw motion trajectory tail
+        if draw_tail and len(player.trajectory_history) > 1:
+            points = [(int(pt.x), int(pt.y)) for pt in player.trajectory_history]
+            for i in range(1, len(points)):
+                thickness = max(1, int(i / len(points) * 3))
+                cv2.line(annotated, points[i - 1], points[i], color, thickness)
 
     return annotated
