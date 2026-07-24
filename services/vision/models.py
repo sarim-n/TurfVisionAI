@@ -2,7 +2,7 @@
 Purpose: Data models for object detection and tracking results in the vision service.
 Dependencies: pydantic, shared.domain.entities
 Inputs: Raw model predictions & tracker updates
-Outputs: Validated domain models for player detection, ball detection, and player tracking
+Outputs: Validated domain models for player detection, ball detection, player tracking, and ball tracking
 """
 
 from typing import Optional
@@ -62,3 +62,23 @@ class PlayerTrackingFrameResult(BaseModel):
     @property
     def active_player_count(self) -> int:
         return len(self.tracked_players)
+
+
+class TrackedBall(BaseModel):
+    """Represents the tracked football with position, velocity, and interpolation status."""
+    center: Point2D = Field(..., description="Current ball center (x, y)")
+    velocity: Point2D = Field(default_factory=lambda: Point2D(x=0.0, y=0.0), description="Velocity vector (vx, vy)")
+    speed_px_per_sec: float = Field(default=0.0, ge=0.0, description="Ball speed in pixels/sec")
+    is_interpolated: bool = Field(default=False, description="True if position was predicted due to occlusion")
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    trajectory_history: list[Point2D] = Field(
+        default_factory=list, description="Historical center positions (flight path)"
+    )
+
+
+class BallTrackingFrameResult(BaseModel):
+    """Aggregated ball tracking output for a single frame."""
+    frame_number: int
+    timestamp_seconds: float
+    has_ball: bool = False
+    tracked_ball: Optional[TrackedBall] = None

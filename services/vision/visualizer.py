@@ -1,13 +1,18 @@
 """
-Purpose: Visualization helper for rendering player detections, ball detections, and player tracking trajectories on OpenCV frames.
+Purpose: Visualization helper for rendering player detections, ball detections, player tracks, and ball tracking vectors on OpenCV frames.
 Dependencies: cv2, numpy, services.vision.models
-Inputs: Raw image frame, PlayerDetectionResult / BallDetectionResult / PlayerTrackingFrameResult
+Inputs: Raw image frame, PlayerDetectionResult / BallDetectionResult / PlayerTrackingFrameResult / BallTrackingFrameResult
 Outputs: Annotated BGR image frame
 """
 
 import cv2
 import numpy as np
-from services.vision.models import BallDetectionResult, PlayerDetectionResult, PlayerTrackingFrameResult
+from services.vision.models import (
+    BallDetectionResult,
+    BallTrackingFrameResult,
+    PlayerDetectionResult,
+    PlayerTrackingFrameResult,
+)
 
 
 def draw_player_detections(
@@ -124,5 +129,61 @@ def draw_player_tracks(
             for i in range(1, len(points)):
                 thickness = max(1, int(i / len(points) * 3))
                 cv2.line(annotated, points[i - 1], points[i], color, thickness)
+
+    return annotated
+
+
+def draw_ball_tracks(
+    image: np.ndarray,
+    result: BallTrackingFrameResult,
+    draw_velocity_arrow: bool = True,
+    draw_flight_tail: bool = True,
+) -> np.ndarray:
+    """Draws tracked football, velocity vector arrow, and flight path trajectory tail."""
+    annotated = image.copy()
+
+    if result.has_ball and result.tracked_ball is not None:
+        tb = result.tracked_ball
+        center_x = int(tb.center.x)
+        center_y = int(tb.center.y)
+
+        # Color: Bright Yellow for active detection, Magenta for interpolated prediction
+        color = (255, 0, 255) if tb.is_interpolated else (0, 255, 255)
+
+        # Draw ball center dot and ring
+        cv2.circle(annotated, (center_x, center_y), 6, color, -1)
+        cv2.circle(annotated, (center_x, center_y), 9, (0, 0, 0), 2)
+
+        # Draw flight trajectory tail
+        if draw_flight_tail and len(tb.trajectory_history) > 1:
+            pts = [(int(pt.x), int(pt.y)) for pt in tb.trajectory_history]
+            for i in range(1, len(pts)):
+                cv2.line(annotated, pts[i - 1], pts[i], (0, 255, 255), 2)
+
+        # Draw velocity arrow
+        if draw_velocity_arrow and (abs(tb.velocity.x) > 1.0 or abs(tb.velocity.y) > 1.0):
+            arrow_end_x = int(center_x + tb.velocity.x * 0.2)
+            arrow_end_y = int(center_y + tb.velocity.y * 0.2)
+            cv2.arrowedLine(
+                annotated,
+                (center_x, center_y),
+                (arrow_end_x, arrow_end_y),
+                (0, 0, 255),
+                2,
+                tipLength=0.3,
+            )
+
+        # Speed text badge
+        status = "INTERPOLATED" if tb.is_interpolated else f"{tb.speed_px_per_sec:.0f} px/s"
+        cv2.putText(
+            annotated,
+            f"BALL ({status})",
+            (center_x + 12, center_y + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
 
     return annotated
