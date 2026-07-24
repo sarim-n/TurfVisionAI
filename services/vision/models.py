@@ -1,13 +1,27 @@
 """
-Purpose: Data models for object detection and tracking results in the vision service.
+Purpose: Data models for object detection, tracking, and spatial pitch coordinates in the vision service.
 Dependencies: pydantic, shared.domain.entities
-Inputs: Raw model predictions & tracker updates
-Outputs: Validated domain models for player detection, ball detection, player tracking, and ball tracking
+Inputs: Raw model predictions, tracking updates, and pitch calibrations
+Outputs: Validated domain models for vision pipeline and camera calibration
 """
 
 from typing import Optional
 from pydantic import BaseModel, Field
 from shared.domain.entities import BoundingBox, Point2D, TrackedObjectType
+
+
+class PitchDimensions(BaseModel):
+    """Real-world dimensions of the football pitch in meters."""
+    length_meters: float = Field(default=105.0, description="Standard pitch length in meters")
+    width_meters: float = Field(default=68.0, description="Standard pitch width in meters")
+    penalty_box_length: float = Field(default=16.5, description="Penalty area length in meters")
+    penalty_box_width: float = Field(default=40.32, description="Penalty area width in meters")
+
+
+class PitchPoint(BaseModel):
+    """2D Real-World Coordinate on the football pitch in meters (0,0 is top-left corner)."""
+    x_meters: float = Field(..., description="X coordinate along pitch length (0 to length_meters)")
+    y_meters: float = Field(..., description="Y coordinate along pitch width (0 to width_meters)")
 
 
 class DetectedObject(BaseModel):
@@ -46,6 +60,7 @@ class TrackedPlayer(BaseModel):
     track_id: int = Field(..., description="Unique persistent tracking ID")
     bbox: BoundingBox = Field(..., description="Current frame bounding box")
     ground_position: Point2D = Field(..., description="Current bottom-center ground location")
+    pitch_position: Optional[PitchPoint] = Field(default=None, description="2D pitch position in meters")
     trajectory_history: list[Point2D] = Field(
         default_factory=list, description="Historical ground positions (motion tail)"
     )
@@ -67,6 +82,7 @@ class PlayerTrackingFrameResult(BaseModel):
 class TrackedBall(BaseModel):
     """Represents the tracked football with position, velocity, and interpolation status."""
     center: Point2D = Field(..., description="Current ball center (x, y)")
+    pitch_position: Optional[PitchPoint] = Field(default=None, description="2D pitch position in meters")
     velocity: Point2D = Field(default_factory=lambda: Point2D(x=0.0, y=0.0), description="Velocity vector (vx, vy)")
     speed_px_per_sec: float = Field(default=0.0, ge=0.0, description="Ball speed in pixels/sec")
     is_interpolated: bool = Field(default=False, description="True if position was predicted due to occlusion")

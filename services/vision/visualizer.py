@@ -1,17 +1,21 @@
 """
-Purpose: Visualization helper for rendering player detections, ball detections, player tracks, and ball tracking vectors on OpenCV frames.
-Dependencies: cv2, numpy, services.vision.models
-Inputs: Raw image frame, PlayerDetectionResult / BallDetectionResult / PlayerTrackingFrameResult / BallTrackingFrameResult
+Purpose: Visualization helper for rendering player detections, ball detections, player tracks, ball tracking vectors, and 2D tactical bird's eye view pitch maps on OpenCV frames.
+Dependencies: cv2, numpy, services.vision.models, services.vision.homography
+Inputs: Raw image frame, Player/Ball tracking results, PitchHomography
 Outputs: Annotated BGR image frame
 """
 
+from typing import Optional
 import cv2
 import numpy as np
+from services.vision.homography import PitchHomography
 from services.vision.models import (
     BallDetectionResult,
     BallTrackingFrameResult,
     PlayerDetectionResult,
     PlayerTrackingFrameResult,
+    TrackedBall,
+    TrackedPlayer,
 )
 
 
@@ -187,3 +191,72 @@ def draw_ball_tracks(
         )
 
     return annotated
+
+
+def draw_birds_eye_view(
+    tracked_players: list[TrackedPlayer],
+    tracked_ball: Optional[TrackedBall],
+    homography: PitchHomography,
+    canvas_size: tuple[int, int] = (600, 400),
+) -> np.ndarray:
+    """Renders a 2D top-down Tactical Pitch map showing player dots, track IDs, and ball position."""
+    canvas_w, canvas_h = canvas_size
+    margin = 30
+    pitch_draw_w = canvas_w - (2 * margin)
+    pitch_draw_h = canvas_h - (2 * margin)
+
+    # Green grass canvas background
+    canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+    canvas[:, :] = (34, 139, 34)  # Forest Green
+
+    # Pitch boundary box
+    cv2.rectangle(
+        canvas,
+        (margin, margin),
+        (margin + pitch_draw_w, margin + pitch_draw_h),
+        (255, 255, 255),
+        2,
+    )
+    # Halfway line
+    mid_x = margin + pitch_draw_w // 2
+    cv2.line(canvas, (mid_x, margin), (mid_x, margin + pitch_draw_h), (255, 255, 255), 2)
+    # Center circle
+    cv2.circle(canvas, (mid_x, margin + pitch_draw_h // 2), 40, (255, 255, 255), 2)
+    cv2.circle(canvas, (mid_x, margin + pitch_draw_h // 2), 4, (255, 255, 255), -1)
+
+    p_dims = homography.pitch_dimensions
+
+    def pitch_to_canvas(px: float, py: float) -> tuple[int, int]:
+        cx = int(margin + (px / p_dims.length_meters) * pitch_draw_w)
+        cy = int(margin + (py / p_dims.width_meters) * pitch_draw_h)
+        return cx, cy
+
+    # Draw tracked players on 2D tactical map
+    for player in tracked_players:
+        pitch_pt = homography.pixel_to_pitch(player.ground_position)
+        cx, cy = pitch_to_canvas(pitch_pt.x_meters, pitch_pt.y_meters)
+
+        np.random.seed(player.track_id)
+        color = tuple(map(int, np.random.randint(80, 255, size=3)))
+
+        cv2.circle(canvas, (cx, cy), 7, color, -1)
+        cv2.circle(canvas, (cx, cy), 9, (255, 255, 255), 1)
+        cv2.putText(
+            canvas,
+            f"#{player.track_id}",
+            (cx + 8, cy + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    # Draw tracked ball on 2D tactical map
+    if tracked_ball is not None:
+        pitch_pt = homography.pixel_to_pitch(tracked_ball.center)
+        bx, by = pitch_to_canvas(pitch_pt.x_meters, pitch_pt.y_meters)
+        cv2.circle(canvas, (bx, by), 6, (0, 255, 255), -1)
+        cv2.circle(canvas, (bx, by), 8, (0, 0, 0), 2)
+
+    return canvas
