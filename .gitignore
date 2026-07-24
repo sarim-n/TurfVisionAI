@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# PyTorch & Machine Learning models
+*.pt
+*.onnx
+*.engine
+*.weights
+models/*.pt
+!models/README.md
+data/
+datasets/
+runs/
+*.mp4
+*.avi
+*.mov
+
+# Environment & Credentials
+.env
+.env.local
+*.pem
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing & Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Database
+*.db
+*.sqlite
